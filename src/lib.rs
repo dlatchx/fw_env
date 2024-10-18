@@ -105,8 +105,9 @@ pub struct FwEnv {
     pub vars: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
-const ENV_SIMPLE_SIZE: usize = std::mem::size_of::<u32>();
-const ENV_REDUNDANT_SIZE: usize = std::mem::size_of::<u32>() + std::mem::size_of::<u8>();
+const ENV_OFFSET_DATA_SIMPLE: usize = std::mem::size_of::<u32>();
+const ENV_OFFSET_FLAGS_REDUNDANT: usize = std::mem::size_of::<u32>();
+const ENV_OFFSET_DATA_REDUNDANT: usize = std::mem::size_of::<u32>() + std::mem::size_of::<u8>();
 
 impl FwEnv {
     // TODO: skip bad blocks on flash
@@ -122,22 +123,58 @@ impl FwEnv {
         file.read_exact(&mut buf)?;
         Ok(buf)
     }
-    // TODO: understand what the flag means, and do the whole flag dance
-    // to read the appropriate block in case of redundancy
-    pub fn read(config: &Config) -> Result<Self, FwError> {
-        let block = Self::read_block(&config.line1.devname, config.line1.start, config.line1.size)?;
+
+    fn crc_ok(block: &Vec<u8>, redundant: bool) -> bool {
         let refcrc: u32 = unsafe { std::mem::transmute([block[0], block[1], block[2], block[3]]) };
-        let skipped_bytes = if config.is_redundant() {
-            ENV_REDUNDANT_SIZE
+        let compcrc = if redundant {
+            crc::crc32::checksum_ieee(&block[ENV_OFFSET_DATA_REDUNDANT..])
         } else {
-            ENV_SIMPLE_SIZE
+            crc::crc32::checksum_ieee(&block[ENV_OFFSET_DATA_SIMPLE..])
         };
-        let crc = crc::crc32::checksum_ieee(&block[skipped_bytes..]);
-        if crc != refcrc {
-            return Err(FwError::BadCrc);
-        }
+        return compcrc == refcrc;
+    }
+
+    pub fn read(config: &Config) -> Result<Self, FwError> {
+        let (data, skipped) = if config.is_redundant() {
+            let block1 = Self::read_block(&config.line1.devname, config.line1.start, config.line1.size)?;
+            let block1_valid = Self::crc_ok(&block1, true);
+
+            let line2 = config.line2.as_ref().unwrap();
+            let block2 = Self::read_block(&line2.devname, line2.start, line2.size)?;
+            let block2_valid = Self::crc_ok(&block2, true);
+
+            if block1_valid && !block2_valid {
+                (block1, ENV_OFFSET_DATA_REDUNDANT)
+            } else if !block1_valid && block2_valid {
+                (block2, ENV_OFFSET_DATA_REDUNDANT)
+            } else if !block1_valid && !block2_valid {
+                return Err(FwError::BadCrc);
+            } else {
+                // both valid, check flags
+                let flags1 = block1[ENV_OFFSET_FLAGS_REDUNDANT];
+                let flags2 = block2[ENV_OFFSET_FLAGS_REDUNDANT];
+
+                if flags1 == 0xFF && flags2 == 0 {
+                    (block2, ENV_OFFSET_DATA_REDUNDANT)
+                } else if flags2 == 0xFF && flags1 == 0 {
+                    (block1, ENV_OFFSET_DATA_REDUNDANT)
+                } else if flags2 > flags1 {
+                    (block2, ENV_OFFSET_DATA_REDUNDANT)
+                } else {
+                    (block1, ENV_OFFSET_DATA_REDUNDANT)
+                }
+            }
+        } else {
+            let block = Self::read_block(&config.line1.devname, config.line1.start, config.line1.size)?;
+            if Self::crc_ok(&block, false) {
+                return Err(FwError::BadCrc);
+            } else {
+                (block, ENV_OFFSET_DATA_SIMPLE)
+            }
+        };
+
         let mut vars = Vec::new();
-        for s in block[skipped_bytes..]
+        for s in data[skipped..]
             .split(|&c| c == 0)
             .take_while(|s| !s.is_empty())
         {
@@ -149,6 +186,7 @@ impl FwEnv {
         }
         Ok(Self { vars })
     }
+
     pub fn find_var<'a, 'b>(&'a self, name: impl Into<&'b [u8]>) -> Option<&'a [u8]> {
         let name = name.into();
         self.vars

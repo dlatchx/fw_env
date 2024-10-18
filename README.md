@@ -16,4 +16,4 @@ Basic usage:
 - [X] find variable by name
 - [ ] full config file (`/etc/fw_env.config`) parsing
 - [ ] handle bad blocks in flash
-- [ ] handle flags in redundant blocks
+- [X] handle flags in redundant blocks
